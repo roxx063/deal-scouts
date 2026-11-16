@@ -25,8 +25,8 @@ Local adaptation: Progress, exclusions and fresh-search lifecycle.
 */
 (function(){
 if(!(location.hostname==="blinkit.com"||location.hostname.endsWith('.'+"blinkit.com"))){alert('Open Blinkit and select your delivery address first.');return;}
-if(document.getElementById('quick-deal-scout-v4-1')){document.getElementById('quick-deal-scout-v4-1').shadowRoot.getElementById('panel').hidden=false;return;}
-if(document.getElementById('quick-deal-scout-v4')||document.getElementById('quick-deal-scout-v3')||document.getElementById('quick-deal-scout-v2')){alert('Reload this shopping tab once before running Scout v4.1. Previous results stay open.');return;}
+if(document.getElementById('quick-deal-scout-v4-2')){document.getElementById('quick-deal-scout-v4-2').shadowRoot.getElementById('panel').hidden=false;return;}
+if(document.getElementById('quick-deal-scout-v4-1')||document.getElementById('quick-deal-scout-v4')||document.getElementById('quick-deal-scout-v3')||document.getElementById('quick-deal-scout-v2')){alert('Reload this shopping tab once before running Scout v4.2. Previous results stay open.');return;}
 
 "use strict";
   // ---------- Context (100% Dynamic Location from Blinkit) ----------
@@ -1880,7 +1880,15 @@ var DealScoutCore = (() => {
   const categoryMatch=(p,value)=>categoryValues(p).some(c=>c.toLowerCase()===value.toLowerCase()||(value==='Beverages'&&beverageCategory(c)));
   const tasks = (groups, selected) => groups.filter(g=>selected.has(g.id)).flatMap(g=>g.tasks.map(t=>({...t,category:g.name})));
   const keywordTasks=(groups,selected)=>[...new Map(groups.filter(g=>selected.has(g.id)).flatMap(g=>(g.keywords||[g.name]).map(name=>({name,keyword:true,category:'Keyword results · taxonomy unverified',sourceGroup:g.name,pageLimit:2}))).map(t=>[t.name.toLowerCase(),t])).values()];
-  function runner({request, context=()=>'', onChange=()=>{}, timeout=45000, delay=0}) {
+  function pacer(interval){
+    let next=0,tail=Promise.resolve();
+    return signal=>{const turn=tail.then(async()=>{signal.throwIfAborted();const wait=Math.max(0,next-Date.now());if(wait)await new Promise((resolve,reject)=>{const cancel=()=>{clearTimeout(timer);reject(new DOMException('Stopped','AbortError'));};const timer=setTimeout(()=>{signal.removeEventListener('abort',cancel);resolve();},wait);signal.addEventListener('abort',cancel,{once:true});});signal.throwIfAborted();next=Date.now()+interval;});tail=turn.catch(()=>{});return turn;};
+  }
+  const previewTasks=(groups,selected)=>[...new Map(groups.filter(g=>selected.has(g.id)).flatMap(g=>{
+    const words=/drink|juice|beverage/i.test(g.name)?['diet coke','soft drinks','juice']:(g.keywords||[g.name]).slice(0,1);
+    return words.map(name=>({name,keyword:true,category:'Keyword preview · taxonomy unverified',sourceGroup:g.name,pageLimit:1}));
+  }).map(t=>[t.name.toLowerCase(),t])).values()];
+  function runner({request, context=()=>'', onChange=()=>{}, timeout=45000, idleTimeout=0, delay=0, concurrency=1}) {
     let generation=0, controller=null, items=new Map();
     const fresh=()=>({status:'idle',total:0,processed:0,succeeded:0,failed:0,limited:0,pages:0,current:'',detail:'',errors:[],coverage:[],started:0,ended:0});
     let state=fresh();
@@ -1900,58 +1908,63 @@ var DealScoutCore = (() => {
         const original=context();let consecutive=0;onChange({...state});
         try {
           if(!queue.length)throw Error('Select at least one category or enter a keyword.');
-          for(const task of queue){
-            if(parent.signal.aborted)break;
-            if(context()!==original){items.clear();throw Error('Delivery location changed. Start a fresh scan.');}
-            state.current=task.name;state.detail='Connecting…';const beforePages=state.pages;onChange({...state});
+          let cursor=0,halted=false,fatal=null;const active=new Map();
+          const updateActive=()=>{state.active=active.size;state.current=[...active.values()].join(' · ');};
+          async function worker(workerId){while(cursor<queue.length&&!halted&&!parent.signal.aborted&&runId===generation){
+            const task=queue[cursor++];
+            if(context()!==original){items.clear();fatal=Error('Delivery location changed. Start a fresh scan.');halted=true;parent.abort();return;}
+            active.set(workerId,task.name);updateActive();state.detail='Connecting…';let taskPages=0;onChange({...state});
             const child=new AbortController();const abort=()=>child.abort();parent.signal.addEventListener('abort',abort,{once:true});
-            let timer;
+            let timer,idleTimer,cancel;
             try {
-              const work=request(task,child.signal,(batch=[],detail='',page=false)=>{
+              let idleReject;const idle=new Promise((_,reject)=>idleReject=reject);
+              const armIdle=()=>{if(idleTimeout){clearTimeout(idleTimer);idleTimer=setTimeout(()=>{child.abort();idleReject(Error('Page request timed out. Retry this aisle.'));},idleTimeout);}};
+              armIdle();
+              const work=Promise.resolve().then(()=>request(task,child.signal,(batch=[],detail='',page=false)=>{
                 if(runId!==generation||child.signal.aborted)return;
                 if(context()!==original){items.clear();throw Error('Delivery location changed. Start a fresh scan.');}
-                state.detail=detail;if(page)state.pages++;
-                for(const p of batch){
-                  ingest([p],task);
-                }onChange({...state});
-              });
+                state.detail=detail;if(page){state.pages++;taskPages++;armIdle();}
+                ingest(batch,task);onChange({...state});
+              }));
               const limit=new Promise((_,reject)=>{timer=setTimeout(()=>{child.abort();reject(Error('Request timed out. Retry this category.'));},timeout);});
-              const cancelled=new Promise((_,reject)=>parent.signal.addEventListener('abort',()=>reject(new DOMException('Stopped','AbortError')),{once:true}));
-              const result=await Promise.race([work,limit,cancelled]);
+              const cancelled=new Promise((_,reject)=>{cancel=()=>reject(new DOMException('Stopped','AbortError'));parent.signal.addEventListener('abort',cancel,{once:true});});
+              const result=await Promise.race([work,limit,idle,cancelled]);
               if(runId!==generation)return;
               if(context()!==original){items.clear();throw Error('Delivery location changed. Start a fresh scan.');}
               if(Array.isArray(result)){
                 ingest(result,task);
               }
               if(result?.truncated){state.limited++;state.detail=result.reason||'More products remain beyond the page limit.';}
-              state.coverage.push({name:task.name,pages:state.pages-beforePages,status:result?.truncated?'incomplete':'checked',reason:result?.reason||''});
+              state.coverage.push({name:task.name,pages:taskPages,status:result?.truncated?'incomplete':'checked',reason:result?.reason||''});
               state.succeeded++;consecutive=0;
             }catch(e){
               if(runId!==generation)return;
-              if(parent.signal.aborted)break;
-              state.failed++;consecutive++;state.errors.push(task.name+': '+e.message);state.coverage.push({name:task.name,pages:state.pages-beforePages,status:'failed',reason:e.message});
-              if(/location changed/i.test(e.message)){items.clear();throw e;}
-              if(/(?:HTTP|Search|BFF)\s*(?:401|403|429)/i.test(e.message)||consecutive>=3){state.detail='Stopped after access errors. Open a normal search, then retry.';state.processed++;break;}
-            }finally{clearTimeout(timer);parent.signal.removeEventListener('abort',abort);}
+              if(parent.signal.aborted)return;
+              state.failed++;consecutive++;state.errors.push(task.name+': '+e.message);state.coverage.push({name:task.name,pages:taskPages,status:'failed',reason:e.message});
+              if(/location changed/i.test(e.message)){items.clear();fatal=e;halted=true;parent.abort();return;}
+              if(/(?:HTTP|Search|BFF)\s*(?:401|403|429)/i.test(e.message)||consecutive>=3){state.detail='Stopped after access errors. Open a normal search, then retry.';halted=true;parent.abort();}
+            }finally{clearTimeout(timer);clearTimeout(idleTimer);parent.signal.removeEventListener('abort',abort);if(cancel)parent.signal.removeEventListener('abort',cancel);active.delete(workerId);if(runId===generation)updateActive();}
             state.processed++;onChange({...state});
             if(delay&&!parent.signal.aborted)await new Promise(r=>{const t=setTimeout(r,delay);parent.signal.addEventListener('abort',()=>{clearTimeout(t);r();},{once:true});});
-          }
+          }}
+          await Promise.all(Array.from({length:Math.min(queue.length,Math.max(1,Math.min(3,concurrency)))},(_,i)=>worker(i)));
+          if(fatal)throw fatal;
           if(runId!==generation)return;
-          state.status=parent.signal.aborted?'stopped':state.failed?(items.size?'partial':'error'):state.limited?'partial':state.processed===state.total?'done':'stopped';
+          state.status=state.failed?(items.size?'partial':'error'):parent.signal.aborted?'stopped':state.limited?'partial':state.processed===state.total?'done':'stopped';
         }catch(e){if(runId!==generation)return;state.errors.push(e.message);state.status='error';}
         finally{if(runId===generation){state.ended=Date.now();onChange({...state});}}
       }
     };return api;
   }
-  return {tasks,keywordTasks,runner,categoryValues,categoryMatch,beverageCategory};
+  return {tasks,keywordTasks,previewTasks,runner,pacer,categoryValues,categoryMatch,beverageCategory};
 })();
 
 /* Results are owned new tabs; shopping pages and previous results are never closed. */
 function mountDealScout(adapter){
- const mobile=MarketplaceCore.isMobile(navigator);const ID='quick-deal-scout-v4-1';if(document.getElementById(ID)){document.getElementById(ID).shadowRoot.getElementById('panel').hidden=false;return;}
+ const mobile=MarketplaceCore.isMobile(navigator);const ID='quick-deal-scout-v4-2';if(document.getElementById(ID)){document.getElementById(ID).shadowRoot.getElementById('panel').hidden=false;return;}
  const host=document.createElement('div');host.id=ID;document.body.append(host);const root=host.attachShadow({mode:'open'});
  const css=SCOUT_STYLE;
- root.innerHTML=`<style>${css}</style><button id="launcher">⚡ ${adapter.name} Scout v4.1</button><section id="panel"><header class="row"><h3>${adapter.name} Scout · v4.1</h3><button id="min">−</button></header><div class="body"><small>${mobile?'Keep this tab active while scanning. Tap View results when finished.':'Uses your selected delivery session. Results open in a new tab.'}</small><div class="row"><b>Include categories</b><button id="all">All</button><button id="none">None</button></div><div id="cats">Loading categories…</div><label>Scan depth <select id="pages"><option value="1" selected>Fast pass · 1 page / aisle</option><option value="2">2 pages / aisle</option><option value="5">5 pages / aisle</option><option value="20">Deep · 20 pages / aisle</option><option value="100">Until end · maximum 100 pages / aisle</option></select></label><button id="scan" class="primary" disabled>⚡ Scan All Included Categories</button><button id="quick" disabled>⚡ Quick Category Deals · 2 pages</button><small>Both scan native category aisles. A page cap, repeated cursor or failed request is reported as incomplete coverage.</small><details><summary>Search a specific product / keywords</summary><textarea id="keywords" rows="2" placeholder="diet coke, coca cola zero"></textarea><button id="custom">Search keywords</button><small>Keyword search is a sample, separate from category coverage. Custom keywords require all category boxes checked.</small></details></div><footer><progress id="bar" value="0" max="1"></progress><div id="progress" role="status" aria-live="polite">Ready for a fresh scan</div><small id="detail"></small><details><summary>Failures / coverage</summary><pre id="errors"></pre></details><div class="row"><button id="stop" disabled>Stop</button><button id="view" disabled>Open results tab</button><button id="reset">New search</button></div></footer></section>`;
+ root.innerHTML=`<style>${css}</style><button id="launcher">⚡ ${adapter.name} Scout v4.2</button><section id="panel"><header class="row"><h3>${adapter.name} Scout · v4.2</h3><button id="min">−</button></header><div class="body"><small>${mobile?'Keep this tab active while scanning. Tap View results when finished.':'Uses your selected delivery session. Results open in a new tab.'}</small><div class="row"><b>Include categories</b><button id="all">All</button><button id="none">None</button></div><div id="cats">Loading categories…</div><label>Scan depth <select id="pages"><option value="1" selected>Fast pass · 1 page / aisle</option><option value="2">2 pages / aisle</option><option value="5">5 pages / aisle</option><option value="20">Deep · 20 pages / aisle</option><option value="100">Until end · maximum 100 pages / aisle</option></select></label><button id="scan" class="primary" disabled>⚡ Scan All Included Categories</button><button id="quick" disabled>Category scan · 2 pages / aisle</button><small>Both scan native category aisles. A page cap, repeated cursor or failed request is reported as incomplete coverage.</small><details><summary>Search a specific product / keywords</summary><textarea id="keywords" rows="2" placeholder="diet coke, coca cola zero"></textarea><button id="custom">Search keywords</button><small>Keyword search is a sample, separate from category coverage. Custom keywords require all category boxes checked.</small></details></div><footer><progress id="bar" value="0" max="1"></progress><div id="progress" role="status" aria-live="polite">Ready for a fresh scan</div><small id="detail"></small><details><summary>Failures / coverage</summary><pre id="errors"></pre></details><div class="row"><button id="stop" disabled>Stop</button><button id="view" disabled>Open results tab</button><button id="reset">New search</button></div></footer></section>`;
  const $=id=>root.getElementById(id);const node=(doc,tag,text)=>{const e=doc.createElement(tag);if(text!==undefined)e.textContent=text;return e;};
  if(adapter.requiresPin){const label=node(document,'label','Delivery PIN'),input=node(document,'input');label.className='pin-row';input.id='locationpin';input.inputMode='numeric';input.maxLength=6;input.placeholder='Selected address PIN';input.value=adapter.getPin();input.oninput=()=>adapter.setPin(input.value.trim());label.append(input);$('cats').before(label);}
  if(adapter.setAutoLocate){const label=node(document,'label'),check=node(document,'input');check.id='auto-locate';check.type='checkbox';check.checked=true;check.onchange=()=>adapter.setAutoLocate(check.checked);label.append(check,document.createTextNode(' '+(adapter.autoLocateLabel||'Use current location if needed')));$('cats').before(label);}
@@ -1961,10 +1974,10 @@ function mountDealScout(adapter){
  let groups=[],active=null,preparing=false,epoch=0,message='',phaseError=false,prepController=null;
  const chosen=()=>new Set([...root.querySelectorAll('#cats input:checked')].map(x=>x.value));
  const safe=(v,image=false)=>{try{const u=new URL(v,location.origin);return /^https?:$/.test(u.protocol)&&(image||adapter.hosts.some(h=>u.hostname===h||u.hostname.endsWith('.'+h)))?u.href:'';}catch{return '';}};
- const runner=DealScoutCore.runner({context:()=>adapter.context(),timeout:600000,delay:adapter.delay??650,request:async(task,signal,emit)=>adapter.request(task,signal,emit,task.pageLimit),onChange:()=>render()});
- function summary(){const s=runner.state;if(preparing)return 'Preparing selected delivery session…';if(phaseError)return 'Cannot start scan · '+message;if(s.status==='idle')return 'Ready for a fresh scan';const sec=Math.floor(((s.ended||Date.now())-s.started)/1000);return `${{running:'Scanning',done:s.limited?'Finished · coverage limited':'Finished requested scans',partial:'Partial results',stopped:'Stopped',error:'Scan failed'}[s.status]} · ${s.processed}/${s.total} aisles/searches checked · ${s.pages} pages · ${runner.items.length} products · ${s.failed} failed · ${s.limited} capped/unresolved · ${sec}s`;}
+ const runner=DealScoutCore.runner({context:()=>adapter.context(),timeout:600000,idleTimeout:adapter.idleTimeout??25000,concurrency:adapter.concurrency??1,delay:adapter.delay??650,request:async(task,signal,emit)=>adapter.request(task,signal,emit,task.pageLimit),onChange:()=>render()});
+ function summary(){const s=runner.state;if(preparing)return 'Preparing selected delivery session…';if(phaseError)return 'Cannot start scan · '+message;if(s.status==='idle')return 'Ready for a fresh scan';const sec=Math.floor(((s.ended||Date.now())-s.started)/1000);return `${{running:'Scanning',done:s.limited?'Finished · coverage limited':'Finished requested scans',partial:'Partial results',stopped:'Stopped',error:'Scan failed'}[s.status]} · ${s.processed}/${s.total} aisles/searches checked · ${s.active||0} active · ${s.pages} pages · ${runner.items.length} products · ${s.failed} failed · ${s.limited} capped/unresolved · ${sec}s`;}
  function render(){const s=runner.state,busy=preparing||s.status==='running';const text=summary();if($('progress').textContent!==text)$('progress').textContent=text;$('progress').dataset.state=phaseError?'error':s.status;$('bar').value=s.total?s.processed/s.total:0;const detail=message||[s.current,s.detail].filter(Boolean).join(' · ');if($('detail').textContent!==detail)$('detail').textContent=detail;$('errors').textContent=[...s.errors,...s.coverage.filter(x=>x.status==='incomplete').map(x=>x.name+': '+(x.reason||'Page cap reached; more products remain.'))].join('\n');
-  $('stop').disabled=!busy;$('view').textContent=mobile?'View results ↗':'Open results tab';$('view').disabled=(mobile&&busy)||(!active&&!runner.items.length&&!busy);$('scan').disabled=busy||!groups.length;$('quick').disabled=busy||!groups.length;
+  $('stop').disabled=!busy;$('view').textContent=mobile?'View results ↗':'Open results tab';$('view').disabled=!active&&!runner.items.length; $('scan').disabled=busy||!groups.length;$('quick').disabled=busy||!groups.length;
   for(const e of root.querySelectorAll('#cats input,#locationpin,#pages,#keywords,#custom,#sample,#auto-locate,#locate,#all,#none'))e.disabled=busy;
   if(active){active.items=runner.items;active.status=text;active.errors=$('errors').textContent;active.version=s.pages+'|'+s.processed+'|'+s.status;paint(active);}
  }
@@ -1973,7 +1986,7 @@ function mountDealScout(adapter){
  function resultTab(){
   if(active&&!active.win.closed)return active;
   const win=window.open('','_blank');if(!win){message='Browser blocked the results tab. Click Open results tab, or allow popups for this site. The shopping page stays open.';render();return null;}
-  win.document.title=adapter.name+' Deals · Scout v4.1';const doc=win.document;const encoding=node(doc,'meta');encoding.setAttribute('charset','utf-8');const viewport=node(doc,'meta');viewport.name='viewport';viewport.content='width=device-width, initial-scale=1';doc.head.prepend(encoding,viewport);doc.body.replaceChildren();const style=node(doc,'style',css);const main=node(doc,'main');doc.body.append(style,main);
+  win.document.title=adapter.name+' Deals · Scout v4.2';const doc=win.document;const encoding=node(doc,'meta');encoding.setAttribute('charset','utf-8');const viewport=node(doc,'meta');viewport.name='viewport';viewport.content='width=device-width, initial-scale=1';doc.head.prepend(encoding,viewport);doc.body.replaceChildren();const style=node(doc,'style',css);const main=node(doc,'main');doc.body.append(style,main);
   const v={win,root:main,items:runner.items,live:true,status:summary(),errors:'',stamp:''};active=v;
   const mast=node(doc,'div');mast.className='masthead';const mark=node(doc,'div','DEAL / SCOUT');mark.className='wordmark';const edition=node(doc,'div','YOUR NEIGHBOURHOOD. BETTER DEALS.');edition.className='edition';mast.append(mark,edition);main.append(mast);
   const header=node(doc,'div');header.className='hero';const title=node(doc,'div');title.append(node(doc,'h1',adapter.name+' deals'));const sub=node(doc,'p','The best savings, in one place.');sub.className='subtitle';title.append(sub);header.append(title);const actions=node(doc,'div');actions.className='hero-actions';const stop=node(doc,'button','Stop scan');stop.onclick=()=>{if(v.live){if(preparing)reset();else runner.stop();}};const fresh=node(doc,'button','Start a new search ↗');fresh.id='rs-new';fresh.onclick=()=>{if(v.live)reset();};actions.append(stop,fresh);header.append(actions);main.append(header);
@@ -1996,14 +2009,14 @@ function mountDealScout(adapter){
  }
  async function start(mode){if(preparing||runner.state.status==='running')return;const selected=chosen();if(!selected.size){message='Select at least one category.';render();return;}let queue;const limit=Number($('pages').value);
   if(mode==='custom'){const words=[...new Set($('keywords').value.split(/[,\n]+/).map(s=>s.trim()).filter(Boolean))];if(!words.length){message='Enter a product or keyword.';render();return;}if(selected.size!==groups.length){message='Custom searches may cross categories. Check all categories or use the category scan.';render();return;}queue=words.map(name=>({name,keyword:true,category:'Keyword search',pageLimit:limit}));}
-  else if(mode==='sample'&&selected.size===groups.length)queue=DealScoutCore.keywordTasks(groups,selected);
+  else if(mode==='sample'&&selected.size===groups.length)queue=DealScoutCore.previewTasks(groups,selected);
   else queue=mode==='quick'&&adapter.quickTasks?adapter.quickTasks(groups,selected):DealScoutCore.tasks(groups,selected).map(t=>({...t,pageLimit:mode==='quick'||mode==='sample'?2:limit}));
   reset();const token=++epoch;prepController=new AbortController();preparing=true;if(!mobile&&!adapter.prepareInSource?.())resultTab();render(); // Native location UI needs its source tab visible. Other scans reserve a results tab synchronously.
-  try{if(adapter.requiresPin)$('panel').hidden=true;await adapter.prepare?.(prepController.signal);if(token!==epoch)return;if(adapter.requiresPin)$('locationpin').value=adapter.getPin();if(token!==epoch)return;preparing=false;if(adapter.requiresPin)$('panel').hidden=false;if(!mobile&&!active)resultTab();message=mobile?'Scanning here; results will open in a new tab when you tap View results.':active?'':'Click Open results tab if your browser blocked it.';await runner.start(queue);if(mobile&&token===epoch){message=runner.items.length?'Tap View results to open your deals in a new tab.':'';render();}}catch(e){if(token===epoch){preparing=false;phaseError=true;message=e.message;render();}}finally{if(token===epoch&&adapter.requiresPin)$('panel').hidden=false;}
+  try{if(adapter.requiresPin)$('panel').hidden=true;await adapter.prepare?.(prepController.signal);if(token!==epoch)return;if(adapter.requiresPin)$('locationpin').value=adapter.getPin();if(token!==epoch)return;preparing=false;if(adapter.requiresPin)$('panel').hidden=false;if(!mobile&&!active)resultTab();message=mobile||active?'':'Click Open results tab if your browser blocked it.';await runner.start(queue);if(mobile&&token===epoch){message=runner.items.length?'Tap View results to open your deals in a new tab.':'';render();}}catch(e){if(token===epoch){preparing=false;phaseError=true;message=e.message;render();}}finally{if(token===epoch&&adapter.requiresPin)$('panel').hidden=false;}
  }
  $('scan').onclick=()=>start('categories');$('quick').onclick=()=>start('quick');$('custom').onclick=()=>start('custom');$('reset').onclick=reset;$('view').onclick=()=>{message='';resultTab();render();};$('stop').onclick=()=>preparing?reset():runner.stop();
  if(adapter.quickLabel){$('quick').textContent=adapter.quickLabel;const hint=node(document,'small',adapter.quickHint);$('quick').after(hint);}
- else{const sample=node(document,'button','⚡ Quick Keyword Deals · sample');sample.id='sample';sample.style.cssText='width:100%;margin:5px 0';sample.onclick=()=>start('sample');$('quick').after(sample);const hint=node(document,'small','Keyword samples can miss items. With exclusions, this button scans only included category aisles. Use Deep category scan for broader coverage.');sample.after(hint);}
+ else{const sample=node(document,'button','⚡ Quick Keyword Deals · fast preview');sample.id='sample';sample.style.cssText='width:100%;margin:5px 0';sample.onclick=()=>start('sample');$('quick').after(sample);const hint=node(document,'small','Fast preview uses one keyword per category, plus soft-drink checks. It is a sample. Category scans check every included aisle; exclusions use that precise aisle scan.');sample.after(hint);}
  $('all').onclick=()=>root.querySelectorAll('#cats input').forEach(c=>c.checked=true);$('none').onclick=()=>root.querySelectorAll('#cats input').forEach(c=>c.checked=false);$('min').onclick=()=>$('panel').hidden=true;$('launcher').onclick=()=>$('panel').hidden=!$('panel').hidden;
  const timer=setInterval(()=>{if(!host.isConnected){runner.stop();clearInterval(timer);return;}if(active?.win.closed){active=null;reset();}else if(runner.state.status==='running'||preparing)render();},700);
  adapter.categories().then(list=>{groups=list;$('cats').replaceChildren();for(const g of groups){const label=node(document,'label'),check=node(document,'input');check.type='checkbox';check.value=g.id;check.checked=true;label.append(check,document.createTextNode(g.name));$('cats').append(label);}render();}).catch(e=>{message='Category list unavailable: '+e.message;phaseError=true;render();});
@@ -2015,6 +2028,7 @@ function scoutKeywords(name) {
   const table=[[/fruit|vegetable/i,['fruit','vegetables']],[/dairy|milk|bread|egg/i,['milk','paneer','cheese','bread']],[/atta|grain|rice|staple|dal|oil|ghee|masala|dry fruit/i,['atta','rice','dal','ghee','oil','masala','dry fruits']],[/snack|munch|biscuit|packaged/i,['snacks','biscuits','noodles']],[/sweet|chocol|ice cream/i,['sweets','chocolate','ice cream']],[/tea|coffee|beverage|drink|juice/i,['tea','coffee','juice','diet coke','soft drinks','soda','water']],[/breakfast|sauce|spread/i,['oats','muesli','peanut butter']],[/protein|nutrition|health/i,['protein','whey']],[/beauty|personal|skin|hair|bath|hygiene/i,['skincare','haircare','oral care']],[/clean|detergent|laundry|household/i,['detergent','cleaning']],[/electronic|mobile|appliance/i,['headphones','charger','air fryer']],[/kitchen|home/i,['kitchen','cookware']],[/baby/i,['diapers','baby food']],[/pet/i,['pet food']]];
   return [...new Set(table.filter(([re])=>re.test(name)).flatMap(([,words])=>words))].length?[...new Set(table.filter(([re])=>re.test(name)).flatMap(([,words])=>words))]:[name];
 }
+const blinkitPace=DealScoutCore.pacer(500);
 const SCOUT_ADAPTERS = {
   'jiomart-quick':()=>{
     const read=k=>{try{return JSON.parse(localStorage.getItem(k));}catch{return localStorage.getItem(k);}};
@@ -2050,8 +2064,8 @@ const SCOUT_ADAPTERS = {
     };
   },
   zepto:()=>({
-    name:'Zepto',hosts:['zepto.com'],context:()=>findStoreId(),
-    async prepare(){capturedHeaders=null;capturedLocation=null;extractLocationFromEnv();await ensureSessionAtStart(()=>{});if(!findStoreId())throw Error('Select a Zepto address and run a normal website search, then retry.');},
+    name:'Zepto',hosts:['zepto.com'],context:()=>{const s=ZeptoSessionCore.selected(getCookie,localStorage);return [s.storeId,s.latitude,s.longitude].join('|');},
+    async prepare(){extractLocationFromEnv();const store=findStoreId();if(capturedHeaders&&(capturedHeaders.store_id||capturedHeaders.storeid)!==store)capturedHeaders=null;if(!store||!capturedLocation)throw Error('Zepto delivery context is unavailable. Reopen its address selector and confirm your selected address.');await ensureSessionAtStart(()=>{});},
     async categories(){
       const cats=new Map((await getCategories(true)).filter(c=>!c.isSpecial).map(c=>[c.categoryId,c]));
       // The grocery layout omits non-grocery departments. Merge actual category links.
@@ -2089,7 +2103,7 @@ const SCOUT_ADAPTERS = {
     }
   }),
   blinkit:()=>({
-    name:'Blinkit',hosts:['blinkit.com'],context:()=>{const c=getDynamicContext();return c.lat+','+c.lon+'|'+c.chainId;},
+    name:'Blinkit',hosts:['blinkit.com'],concurrency:2,delay:0,idleTimeout:20000,context:()=>{const c=getDynamicContext();return c.lat+','+c.lon+'|'+c.chainId;},
     async prepare(){CTX=getDynamicContext();if(!CTX.detected)throw Error('Select your delivery address on Blinkit first.');fullSearchCache.clear();megaScoutCache.clear();catDealsCache.clear();},
     async categories(){return TAXONOMY.map(c=>({id:c.uuid,name:c.name,keywords:scoutKeywords(c.name),tasks:[...c.groupings.map(sub=>({name:c.name+' / '+sub.name,cat:c,sub})),...(/Drinks & Juices/i.test(c.name)?[{name:c.name+' / beverage search cross-check',supplemental:true,queries:['diet coke','coca cola zero','pepsi','soft drinks','soda','energy drink','coconut water']}]:[])]}));},
     async request(t,signal,emit,pages){
@@ -2103,14 +2117,14 @@ const SCOUT_ADAPTERS = {
         if(url.origin!==location.origin||!['/v1/layout/search','/v1/layout/listing_widgets'].includes(url.pathname))throw Error('Unexpected continuation URL.');
         if(nextUrl){for(const [k,v] of url.searchParams)body[k]=v;}
         else{for(const [k,v] of Object.entries(params))url.searchParams.set(k,v);url.searchParams.set('page_index',page);url.searchParams.set('offset',page*15);url.searchParams.set('sort','discount_desc');}
-        const res=await fetch(url,{method:'POST',signal,headers:{'content-type':'application/json',app_client:'consumer_web',lat:CTX.lat,lon:CTX.lon},body:JSON.stringify(body)});
+        await blinkitPace(signal);signal.throwIfAborted();const res=await fetch(url,{method:'POST',signal,headers:{'content-type':'application/json',app_client:'consumer_web',lat:CTX.lat,lon:CTX.lon},body:JSON.stringify(body)});
         if(!res.ok)throw Error('HTTP '+res.status);const data=await res.json();
         if(!data||typeof data!=='object')throw Error('Unrecognized listing response');
         const items=parseItems(data);emit(items.map(p=>({id:p.productId,name:p.name,pack:p.variant,brand:p.brand,price:p.price,mrp:p.mrp,image:p.image,category:p.category||t.sub?.name||'',parentCategory:t.category,subcategory:t.sub?.name||'',url:'https://blinkit.com/prn/'+encodeURIComponent(p.name.toLowerCase().replaceAll(' ','-'))+'/prid/'+p.productId,soldOut:p.soldOut,stock:p.soldOut?'Out of stock':'Listed; confirm delivery on product page'})),`Fetched page ${page+1}`,true);
         nextUrl=data.response?.pagination?.next_url||data.pagination?.next_url||null;more=!!nextUrl;
         if(!more)return {truncated:false};
         if(seenCursors.has(nextUrl))return {truncated:true,reason:'The server repeated its continuation cursor; remaining coverage is unresolved.'};
-        seenCursors.add(nextUrl);await new Promise(r=>setTimeout(r,650));
+        seenCursors.add(nextUrl);if(page+1<pages)await new Promise(r=>setTimeout(r,200));
       }
       return {truncated:more};
     }
